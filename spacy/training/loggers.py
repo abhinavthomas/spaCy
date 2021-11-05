@@ -1,3 +1,4 @@
+import re
 from typing import TYPE_CHECKING, Dict, Any, Tuple, Callable, List, Optional, IO
 from wasabi import Printer
 import tqdm
@@ -29,7 +30,7 @@ def console_logger(progress_bar: bool = False):
     def setup_printer(
         nlp: "Language", stdout: IO = sys.stdout, stderr: IO = sys.stderr
     ) -> Tuple[Callable[[Optional[Dict[str, Any]]], None], Callable[[], None]]:
-        write = lambda text: print(text, file=stdout, flush=True)
+        def write(text): return print(text, file=stdout, flush=True)
         msg = Printer(no_print=True)
         # ensure that only trainable components are logged
         logged_pipes = [
@@ -39,12 +40,14 @@ def console_logger(progress_bar: bool = False):
         ]
         eval_frequency = nlp.config["training"]["eval_frequency"]
         score_weights = nlp.config["training"]["score_weights"]
-        score_cols = [col for col, value in score_weights.items() if value is not None]
+        score_cols = [col for col, value in score_weights.items()
+                      if value is not None]
         loss_cols = [f"Loss {pipe}" for pipe in logged_pipes]
         spacing = 2
         table_header, table_widths, table_aligns = setup_table(
             cols=["E", "#"] + loss_cols + score_cols + ["Score"],
-            widths=[3, 6] + [8 for _ in loss_cols] + [6 for _ in score_cols] + [6],
+            widths=[3, 6] + [8 for _ in loss_cols]
+            + [6 for _ in score_cols] + [6],
         )
         write(msg.row(table_header, widths=table_widths, spacing=spacing))
         write(msg.row(["-" * width for width in table_widths], spacing=spacing))
@@ -84,7 +87,8 @@ def console_logger(progress_bar: bool = False):
             if progress is not None:
                 progress.close()
             write(
-                msg.row(data, widths=table_widths, aligns=table_aligns, spacing=spacing)
+                msg.row(data, widths=table_widths,
+                        aligns=table_aligns, spacing=spacing)
             )
             if progress_bar:
                 # Set disable=None, so that it disables on non-TTY
@@ -136,12 +140,14 @@ def wandb_logger_v2(
             metadata: Optional[Dict[str, Any]] = {},
             aliases: Optional[List[str]] = [],
         ):
-            dataset_artifact = wandb.Artifact(name, type=type, metadata=metadata)
+            dataset_artifact = wandb.Artifact(
+                name, type=type, metadata=metadata)
             dataset_artifact.add_dir(path, name=name)
             wandb.log_artifact(dataset_artifact, aliases=aliases)
 
         if log_dataset_dir:
-            log_dir_artifact(path=log_dataset_dir, name="dataset", type="dataset")
+            log_dir_artifact(path=log_dataset_dir,
+                             name="dataset", type="dataset")
 
         def log_step(info: Optional[Dict[str, Any]]):
             console_log_step(info)
@@ -222,12 +228,14 @@ def wandb_logger_v3(
             metadata: Optional[Dict[str, Any]] = {},
             aliases: Optional[List[str]] = [],
         ):
-            dataset_artifact = wandb.Artifact(name, type=type, metadata=metadata)
+            dataset_artifact = wandb.Artifact(
+                name, type=type, metadata=metadata)
             dataset_artifact.add_dir(path, name=name)
             wandb.log_artifact(dataset_artifact, aliases=aliases)
 
         if log_dataset_dir:
-            log_dir_artifact(path=log_dataset_dir, name="dataset", type="dataset")
+            log_dir_artifact(path=log_dataset_dir,
+                             name="dataset", type="dataset")
 
         def log_step(info: Optional[Dict[str, Any]]):
             console_log_step(info)
@@ -259,6 +267,95 @@ def wandb_logger_v3(
         def finalize() -> None:
             console_finalize()
             wandb.join()
+
+        return log_step, finalize
+
+    return setup_logger
+
+
+@registry.loggers("spacy.MLFlow.v1")
+def mlflow_logger_v1(
+    remove_config_values: List[str] = [],
+    model_log_interval: Optional[int] = None,
+    log_dataset_dir: Optional[str] = None,
+    run_name: Optional[str] = None,
+    log_best_model: Optional[bool] = False
+):
+    try:
+        import mlflow
+    except ImportError:
+        raise ImportError(Errors.E880)
+
+    console = console_logger(progress_bar=False)
+
+    def setup_logger(
+        nlp: "Language", stdout: IO = sys.stdout, stderr: IO = sys.stderr
+    ) -> Tuple[Callable[[Dict[str, Any]], None], Callable[[], None]]:
+        config = nlp.config.interpolate()
+        config_dot = util.dict_to_dot(config)
+        for field in remove_config_values:
+            del config_dot[field]
+        config = util.dot_to_dict(config_dot)
+        _ml_flow = mlflow
+
+        _ml_flow.start_run(run_name=run_name,
+                           nested=_ml_flow.active_run() is not None)
+
+        # Required as MLFlow doesn't support @ to be part of keys of parameters and metrics
+        pattern = re.compile('[\W]+')
+
+        def log_params(param: Dict[str, Any], parent: str = ''):
+            for k, v in param.items():
+                if isinstance(v, (dict,)):
+                    if parent:
+                        log_params(v, f"{parent}.{k}")
+                    else:
+                        log_params(v, k)
+                else:
+                    if parent:
+                        _ml_flow.log_param(
+                            pattern.sub('.', f"{parent}.{k}"), v)
+                    else:
+                        _ml_flow.log_param(pattern.sub('.', k), v)
+
+        log_params(config)
+
+        def log_metric(metric: Dict[str, Any], parent: str = '', step: Optional[int] = None):
+            for k, v in metric.items():
+                if isinstance(v, (dict,)):
+                    if parent:
+                        log_metric(v, f"{parent}.{k}", step)
+                    else:
+                        log_metric(v, k, step)
+                else:
+                    if parent:
+                        _ml_flow.log_metric(pattern.sub(
+                            '.', f"{parent}.{k}"), v, step=step)
+                    else:
+                        _ml_flow.log_metric(pattern.sub('.', k), v, step=step)
+
+        console_log_step, console_finalize = console(nlp, stdout, stderr)
+
+        if log_dataset_dir:
+            _ml_flow.log_artifact(log_dataset_dir, "dataset")
+
+        def log_step(info: Optional[Dict[str, Any]]):
+            console_log_step(info)
+            if info is not None:
+                if model_log_interval and info.get("output_path"):
+                    if info["step"] % model_log_interval == 0 and info["step"] != 0:
+                        metrics = {k: info.get(k) for k in (
+                            "losses", "score", "other_scores")}
+                        log_metric(metrics, step=info.get("step"))
+                        _ml_flow.spacy.log_model(
+                            nlp, f"models/checkpoints/epoch_{info['epoch']}_step_{info['step']}")
+                        if log_best_model and info["score"] == max(info["checkpoints"])[0]:
+                            _ml_flow.spacy.log_model(
+                                nlp, f"models/best-model")
+
+        def finalize() -> None:
+            console_finalize()
+            _ml_flow.end_run()
 
         return log_step, finalize
 
